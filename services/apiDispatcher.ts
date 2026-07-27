@@ -1,3 +1,4 @@
+import React from 'react';
 import { Task, TaskStatus, TimeSegment, Tag, RecurrenceType, Priority, AppSettings } from '../types';
 
 export interface ApiCommandPayload {

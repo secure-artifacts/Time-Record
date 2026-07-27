@@ -2,7 +2,7 @@
   "name": "mindflow-ai-assistant",
   "productName": "MindFlow AI",
   "private": true,
-  "version": "1.0.20",
+  "version": "1.0.21",
   "description": "Local AI Task Assistant",
   "author": "nuosishizi",
   "main": "electron/main.cjs",
