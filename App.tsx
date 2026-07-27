@@ -18,6 +18,7 @@ import { DeleteConfirmModal } from './components/DeleteConfirmModal';
 import { ResumeModal } from './components/ResumeModal';
 import { SettingsModal } from './components/SettingsModal';
 import { RetroactiveModal } from './components/RetroactiveModal';
+import { handleApiCommand } from './services/apiDispatcher';
 import { Task, TaskStatus, TimeSegment, RecurrenceType, Tag, AIReminder, Priority } from './types';
 
 const DEFAULT_TAGS: Tag[] = [
@@ -552,6 +553,46 @@ const App: React.FC = () => {
     };
     setTasks(prev => [...prev, nextTask]);
   };
+
+  // --- API Command Dispatcher Listener ---
+  useEffect(() => {
+    if (typeof window !== 'undefined' && (window as any).require) {
+      try {
+        const { ipcRenderer } = (window as any).require('electron');
+        const apiListener = (_event: any, payload: any) => {
+          handleApiCommand(payload, {
+            tasks,
+            setTasks,
+            tags,
+            setTags,
+            segments,
+            setSegments,
+            settings: {
+              model: 'gemini-2.5-flash',
+              timezone,
+              autoBackupInterval: 1,
+              enableApiServer: true,
+              apiPort: 3618
+            },
+            handleStartTask: (taskId: string) => changeTaskStatus(taskId, TaskStatus.RUNNING),
+            handlePauseTask: (taskId: string) => changeTaskStatus(taskId, TaskStatus.PAUSED),
+            handleCompleteTask: (taskId: string) => changeTaskStatus(taskId, TaskStatus.COMPLETED),
+            handleDeleteTask: (taskId: string) => {
+              setTasks(prev => prev.filter(t => t.id !== taskId));
+              setSegments(prev => prev.filter(s => s.taskId !== taskId));
+            },
+            handleRetroactiveAdd: (title: string, tagId: string, startTimeMs: number, endTimeMs: number) => {
+              addRetroactiveTask(title, tagId, startTimeMs, endTimeMs, '');
+            }
+          });
+        };
+        ipcRenderer.on('api-command', apiListener);
+        return () => {
+          ipcRenderer.removeListener('api-command', apiListener);
+        };
+      } catch (e) {}
+    }
+  }, [tasks, tags, segments, timezone]);
 
   const snoozeTask = () => {
       if (!aiPopup?.relatedTaskId) return;

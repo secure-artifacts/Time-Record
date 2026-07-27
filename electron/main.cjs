@@ -1,5 +1,6 @@
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
+const apiServer = require('./apiServer.cjs');
 
 // 修复 Windows 安装时的快捷方式问题
 if (require('electron-squirrel-startup')) app.quit();
@@ -52,6 +53,18 @@ if (!gotTheLock) {
   app.whenReady().then(() => {
     createWindow();
 
+    // 初始化 API 服务器
+    apiServer.init(() => mainWindow, {
+      port: 3618,
+      enabled: true,
+      token: ''
+    });
+
+    // 监听来自渲染进程的 API 配置更新指令
+    ipcMain.on('update-api-config', (event, config) => {
+      apiServer.updateConfig(config);
+    });
+
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
@@ -59,5 +72,6 @@ if (!gotTheLock) {
 }
 
 app.on('window-all-closed', () => {
+  apiServer.stop();
   if (process.platform !== 'darwin') app.quit();
 });

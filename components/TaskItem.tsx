@@ -9,6 +9,7 @@ interface TaskItemProps {
   onStatusChange: (id: string, newStatus: TaskStatus) => void;
   onEdit: (task: Task) => void;
   onDelete: (task: Task) => void;
+  onEditSegments?: (task: Task) => void;
 }
 
 export const TaskItem: React.FC<TaskItemProps> = ({ task, tag, currentSegmentStartTime, onStatusChange, onEdit, onDelete, onEditSegments }) => {
