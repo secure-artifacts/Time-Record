@@ -1,13 +1,20 @@
 import React, { useState, useEffect } from 'react';
 import { TimeSegment, Tag, Task } from '../types';
+import {
+  addDaysToDateStr,
+  getTrailingWeekDateStrs,
+  splitRangeByZonedHours,
+  zonedWallTimeToUtc,
+} from '../utils/timeUtils';
 
 interface WeeklyHeatmapProps {
   segments: TimeSegment[];
   tasks: Task[];
   tags: Tag[];
+  timezone: string;
 }
 
-export const WeeklyHeatmap: React.FC<WeeklyHeatmapProps> = ({ segments, tasks, tags }) => {
+export const WeeklyHeatmap: React.FC<WeeklyHeatmapProps> = ({ segments, tasks, tags, timezone }) => {
   const hours = Array.from({ length: 24 }, (_, i) => i);
   const daysMap = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
   
@@ -23,62 +30,38 @@ export const WeeklyHeatmap: React.FC<WeeklyHeatmapProps> = ({ segments, tasks, t
       }
   }, [toastMsg]);
 
-  // Generate the 7 days based on weekOffset
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  today.setDate(today.getDate() + weekOffset * 7);
-  const weekDates = Array.from({ length: 7 }, (_, i) => {
-      return new Date(today.getTime() - (6 - i) * 24 * 3600 * 1000);
+  const weekDateStrs = getTrailingWeekDateStrs(timezone, weekOffset);
+  const weekDates = weekDateStrs.map(s => {
+      const [y, m, d] = s.split('-').map(Number);
+      return new Date(y, m - 1, d);
   });
 
   // grid[dIndex][hour] = array of task segments
   const grid: { id: string, name: string, color: string, tagName: string, topPct: number, heightPct: number }[][][] = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => []));
 
+  const now = Date.now();
   segments.forEach(seg => {
-    const start = new Date(seg.startTime);
-    const end = seg.endTime ? new Date(seg.endTime) : new Date();
-    
-    // Safety cap
-    const maxEnd = new Date(start.getTime() + 7 * 24 * 3600 * 1000);
-    const actualEnd = end > maxEnd ? maxEnd : end;
+    const actualEnd = Math.min(seg.endTime ?? now, seg.startTime + 7 * 24 * 3600 * 1000);
+    const slices = splitRangeByZonedHours(seg.startTime, actualEnd, timezone);
+    const task = tasks.find(t => t.id === seg.taskId);
+    const tag = tags.find(t => t.id === task?.tagId);
 
-    let current = new Date(start);
-    while (current < actualEnd) {
-        const currentMidnight = new Date(current);
-        currentMidnight.setHours(0, 0, 0, 0);
-        
-        // Find which column this segment belongs to
-        const dIndex = weekDates.findIndex(d => d.getTime() === currentMidnight.getTime());
-        
-        if (dIndex !== -1) {
-            const hour = current.getHours();
-            const nextHour = new Date(current);
-            nextHour.setHours(hour + 1, 0, 0, 0);
-            
-            const segmentEndForThisHour = actualEnd < nextHour ? actualEnd : nextHour;
-            const durationMin = (segmentEndForThisHour.getTime() - current.getTime()) / 60000;
-            const topPct = (current.getMinutes() / 60) * 100;
-            let heightPct = (durationMin / 60) * 100;
-            
-            if (heightPct < 5) heightPct = 5;
+    slices.forEach(slice => {
+        const dIndex = weekDateStrs.indexOf(slice.dateStr);
+        if (dIndex === -1) return;
+        const topPct = (slice.minuteStartInHour / 60) * 100;
+        let heightPct = (slice.durationMin / 60) * 100;
+        if (heightPct < 5) heightPct = 5;
 
-            const task = tasks.find(t => t.id === seg.taskId);
-            const tag = tags.find(t => t.id === task?.tagId);
-            
-            grid[dIndex][hour].push({
-                id: seg.id + current.getTime(), 
-                name: task?.title || 'Unknown',
-                tagName: tag?.name || 'Unknown',
-                color: tag?.color || 'bg-slate-600',
-                topPct,
-                heightPct
-            });
-        }
-        
-        const nextH = new Date(current);
-        nextH.setHours(current.getHours() + 1, 0, 0, 0);
-        current = nextH;
-    }
+        grid[dIndex][slice.hour].push({
+            id: seg.id + slice.start,
+            name: task?.title || 'Unknown',
+            tagName: tag?.name || 'Unknown',
+            color: tag?.color || 'bg-slate-600',
+            topPct,
+            heightPct
+        });
+    });
   });
 
   const copyToSpreadsheet = (datesToExport: Date[], label: string) => {
@@ -89,9 +72,13 @@ export const WeeklyHeatmap: React.FC<WeeklyHeatmapProps> = ({ segments, tasks, t
         let row = includeTimeColumn ? [timeLabel] : [];
         
         for (const d of datesToExport) {
-            const blockStart = new Date(d);
-            blockStart.setHours(h, 0, 0, 0);
-            const blockEnd = new Date(blockStart.getTime() + 60 * 60000); // 1 hour block
+            const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            const blockStart = new Date(zonedWallTimeToUtc(dateStr, h, 0, timezone));
+            const blockEnd = new Date(
+              h === 23
+                ? zonedWallTimeToUtc(addDaysToDateStr(dateStr, 1), 0, 0, timezone)
+                : zonedWallTimeToUtc(dateStr, h + 1, 0, timezone)
+            );
             
             const overlappingSegs = segments.filter(seg => {
                 const s = new Date(seg.startTime);
@@ -154,10 +141,9 @@ export const WeeklyHeatmap: React.FC<WeeklyHeatmapProps> = ({ segments, tasks, t
     };
 
     const dailyTotals = datesToExport.map(d => {
-        const dayStart = new Date(d);
-        dayStart.setHours(0, 0, 0, 0);
-        const dayEnd = new Date(d);
-        dayEnd.setHours(24, 0, 0, 0);
+        const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        const dayStart = new Date(zonedWallTimeToUtc(dateStr, 0, 0, timezone));
+        const dayEnd = new Date(zonedWallTimeToUtc(addDaysToDateStr(dateStr, 1), 0, 0, timezone));
         
         let totalActiveMins = 0;
         segments.forEach(seg => {

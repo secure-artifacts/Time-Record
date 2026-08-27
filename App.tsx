@@ -19,7 +19,42 @@ import { ResumeModal } from './components/ResumeModal';
 import { SettingsModal } from './components/SettingsModal';
 import { RetroactiveModal } from './components/RetroactiveModal';
 import { handleApiCommand } from './services/apiDispatcher';
-import { Task, TaskStatus, TimeSegment, RecurrenceType, Tag, AIReminder, Priority } from './types';
+import { Task, TaskStatus, TimeSegment, RecurrenceType, Tag, AIReminder, Priority, AppSettings } from './types';
+import { addMonthsClamped, getDateStringInZone } from './utils/timeUtils';
+import {
+  applyStatusChange,
+  clipOverlappingSegments,
+  closeOpenSegmentsNow,
+  pauseTasksMissingOpenSegment,
+  recoverOpenSegments,
+  recomputeAllDurations,
+  sumDurationForTask,
+} from './utils/taskTime';
+
+const SETTINGS_KEY = 'mindflow_settings_v7';
+
+const defaultSettings = (): AppSettings => ({
+  model: 'gemini-2.5-flash',
+  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  autoBackupInterval: 1,
+  enableApiServer: true,
+  apiPort: 3618,
+  apiToken: '',
+});
+
+const pushApiConfig = (next: AppSettings) => {
+  if (typeof window === 'undefined' || !(window as any).require) return;
+  try {
+    const { ipcRenderer } = (window as any).require('electron');
+    ipcRenderer.send('update-api-config', {
+      port: next.apiPort || 3618,
+      enabled: next.enableApiServer !== false,
+      token: next.apiToken || '',
+    });
+  } catch (e) {
+    console.error('Failed to notify Electron API config:', e);
+  }
+};
 
 const DEFAULT_TAGS: Tag[] = [
   { id: 't-work', name: '工作', color: 'bg-blue-500', description: '代码, 会议, 文档, 业务' },
@@ -42,6 +77,7 @@ const App: React.FC = () => {
   const [showRetroactive, setShowRetroactive] = useState(false);
   const [focusMode, setFocusMode] = useState<string | null>(null);
   const [timezone, setTimezone] = useState(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  const [autoBackupInterval, setAutoBackupInterval] = useState(1);
 
   const [interruptedTaskId, setInterruptedTaskId] = useState<string | null>(null);
   const [aiPopup, setAiPopup] = useState<AIReminder | null>(null);
@@ -52,17 +88,26 @@ const App: React.FC = () => {
   const [showOlderCompleted, setShowOlderCompleted] = useState(false);
 
   const audioCtx = useRef<AudioContext | null>(null);
+  const tasksRef = useRef<Task[]>([]);
+  const segmentsRef = useRef<TimeSegment[]>([]);
+  const tagsRef = useRef<Tag[]>([]);
+  tasksRef.current = tasks;
+  segmentsRef.current = segments;
+  tagsRef.current = tags;
+
 // --- Initialization ---
   const [isLoaded, setIsLoaded] = useState(false); // 新增：防止初始数据被覆盖的锁
   useEffect(() => {
-    // 0. Load Settings (Timezone)
-    const savedSettings = localStorage.getItem('mindflow_settings_v7');
+    let loadedSettings = defaultSettings();
+    const savedSettings = localStorage.getItem(SETTINGS_KEY);
     if (savedSettings) {
         try {
-            const parsed = JSON.parse(savedSettings);
-            if (parsed.timezone) setTimezone(parsed.timezone);
+            loadedSettings = { ...loadedSettings, ...JSON.parse(savedSettings) };
         } catch (e) {}
     }
+    setTimezone(loadedSettings.timezone);
+    setAutoBackupInterval(loadedSettings.autoBackupInterval || 1);
+    pushApiConfig(loadedSettings);
 
     // 1. Load Tags
     const savedTags = localStorage.getItem('mindflow_tags_v7');
@@ -92,30 +137,27 @@ const App: React.FC = () => {
         } catch (e) {}
     }
 
-    // Fix open segments (app closed while task was running)
-    const now = Date.now();
-    let needsUpdate = false;
-
-    loadedSegments = loadedSegments.map(seg => {
-        if (seg.endTime === null) {
-            needsUpdate = true;
-            // Cap at 2 hours or current time
-            const cappedEndTime = Math.min(now, seg.startTime + 2 * 3600 * 1000);
-            
-            // Add duration to corresponding task
-            const task = loadedTasks.find(t => t.id === seg.taskId);
-            if (task) {
-                task.totalDuration += Math.floor((cappedEndTime - seg.startTime) / 1000);
-                task.status = TaskStatus.PAUSED; // Ensure task is paused
-            }
-            
-            return { ...seg, endTime: cappedEndTime };
-        }
-        return seg;
-    });
+    const recovered = recoverOpenSegments(loadedTasks, loadedSegments);
+    loadedTasks = recovered.tasks;
+    loadedSegments = recovered.segments;
 
     setTasks(loadedTasks);
     setSegments(loadedSegments);
+    tasksRef.current = loadedTasks;
+    segmentsRef.current = loadedSegments;
+
+    if (recovered.recovered > 0) {
+      const capNote = recovered.capped > 0
+        ? `未正常关闭的时段最多计入 8 小时（共 ${recovered.capped} 段被封顶）。`
+        : '已按关闭前的实际时间暂停。';
+      setTimeout(() => {
+        setAiPopup({
+          show: true,
+          message: `检测到上次有进行中的计时，已自动暂停。${capNote}`,
+          type: 'undo',
+        });
+      }, 300);
+    }
 
     // 4. Request Permissions
     if (Notification.permission !== 'granted') Notification.requestPermission();
@@ -144,8 +186,33 @@ const App: React.FC = () => {
     localStorage.setItem('mindflow_segments_v7', JSON.stringify(segments));
     localStorage.setItem('mindflow_tags_v7', JSON.stringify(tags));
 
-    checkAndPerformBackup(tasks, segments, tags, 12);
-  }, [tasks, segments, tags, isLoaded]); // 记得把 isLoaded 加到依赖列表里
+    checkAndPerformBackup(tasks, segments, tags, autoBackupInterval);
+  }, [tasks, segments, tags, isLoaded, autoBackupInterval]);
+
+  // Graceful close/refresh: pause running tasks at the real clock time so a restart does not hit the crash cap.
+  useEffect(() => {
+    if (!isLoaded) return;
+
+    const flush = () => {
+      const closed = closeOpenSegmentsNow(tasksRef.current, segmentsRef.current);
+      const nextTasks = closed.changed ? closed.tasks : tasksRef.current;
+      const nextSegs = closed.changed ? closed.segments : segmentsRef.current;
+      try {
+        localStorage.setItem('mindflow_tasks_v7', JSON.stringify(nextTasks));
+        localStorage.setItem('mindflow_segments_v7', JSON.stringify(nextSegs));
+        localStorage.setItem('mindflow_tags_v7', JSON.stringify(tagsRef.current));
+      } catch (e) {
+        console.error('Failed to flush on exit', e);
+      }
+    };
+
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+    };
+  }, [isLoaded]);
 
   // --- Reminder System ---
   useEffect(() => {
@@ -159,22 +226,23 @@ const App: React.FC = () => {
             
             for (const offsetMin of task.reminderOffsets) {
                 const triggerTime = planTime - (offsetMin * 60 * 1000);
-                if (now >= triggerTime && now < triggerTime + 60000) {
-                     if (!task.lastRemindedAt || (now - task.lastRemindedAt > 60000)) {
+                if (now >= triggerTime && now < triggerTime + 10 * 60 * 1000) {
+                     if (!task.lastRemindedAt || task.lastRemindedAt < triggerTime) {
                          triggerAlert(task, 'reminder', offsetMin);
                          return;
                      }
                 }
             }
 
-            if (task.status === TaskStatus.WAITING && now > planTime && now < planTime + 60000) {
-                if (!task.lastRemindedAt || (now - task.lastRemindedAt > 60000)) {
+            if (task.status === TaskStatus.WAITING && now > planTime && now < planTime + 10 * 60 * 1000) {
+                if (!task.lastRemindedAt || task.lastRemindedAt < planTime) {
                     triggerAlert(task, 'alert', 0);
                 }
             }
         }
     };
 
+    checkReminders();
     const interval = setInterval(checkReminders, 30000); 
     return () => clearInterval(interval);
   }, [tasks]);
@@ -260,6 +328,9 @@ const App: React.FC = () => {
   };
 
   const handleClearData = () => {
+      tasksRef.current = [];
+      segmentsRef.current = [];
+      tagsRef.current = DEFAULT_TAGS;
       setTasks([]);
       setSegments([]);
       setTags(DEFAULT_TAGS);
@@ -270,9 +341,18 @@ const App: React.FC = () => {
   };
 
   const handleImportData = (data: { tasks: Task[], tags: Tag[], segments: TimeSegment[] }) => {
-      if (data.tasks) setTasks(data.tasks);
-      if (data.tags) setTags(data.tags);
-      if (data.segments) setSegments(data.segments);
+      if (data.tasks) {
+        tasksRef.current = data.tasks;
+        setTasks(data.tasks);
+      }
+      if (data.tags) {
+        tagsRef.current = data.tags;
+        setTags(data.tags);
+      }
+      if (data.segments) {
+        segmentsRef.current = data.segments;
+        setSegments(data.segments);
+      }
   };
 
 // --- Task CRUD Logic ---
@@ -282,7 +362,7 @@ const App: React.FC = () => {
     
     // Auto-pause if interruption
     if (isInterruption) {
-      const currentRunning = tasks.find(t => t.status === TaskStatus.RUNNING);
+      const currentRunning = tasksRef.current.find(t => t.status === TaskStatus.RUNNING);
       if (currentRunning) {
         setInterruptedTaskId(currentRunning.id); // Save ID to resume later
         await changeTaskStatus(currentRunning.id, TaskStatus.PAUSED);
@@ -307,25 +387,29 @@ const App: React.FC = () => {
       totalDuration: 0
     };
 
-    setTasks(prev => [...prev, newTask]);
-
+    const nextTasks = [...tasksRef.current, newTask];
+    let nextSegs = segmentsRef.current;
     if (isInterruption) {
-      const newSegment: TimeSegment = {
+      nextSegs = [...nextSegs, {
         id: crypto.randomUUID(),
         taskId: newTask.id,
         startTime: Date.now(),
         endTime: null
-      };
-      setSegments(prev => [...prev, newSegment]);
+      }];
       playSound('start');
     }
+    tasksRef.current = nextTasks;
+    segmentsRef.current = nextSegs;
+    setTasks(nextTasks);
+    setSegments(nextSegs);
 
     return newTask; 
   };
   
   const addRetroactiveTask = (title: string, tagId: string, startTime: number, endTime: number, description: string) => {
     const taskId = crypto.randomUUID();
-    const durationSec = Math.floor((endTime - startTime) / 1000);
+    const now = Date.now();
+    const durationSec = Math.max(0, Math.floor((endTime - startTime) / 1000));
     
     const newTask: Task = {
       id: taskId,
@@ -338,7 +422,7 @@ const App: React.FC = () => {
       description: description,
       links: '',
       reminderOffsets: [],
-      createdAt: Date.now(),
+      createdAt: now,
       totalDuration: durationSec,
       completedAt: endTime
     };
@@ -350,66 +434,26 @@ const App: React.FC = () => {
       endTime
     };
 
-    // Save history for UNDO
-    const historyState = { tasks: [...tasks], segments: [...segments] };
+    const currentTasks = tasksRef.current;
+    const currentSegments = segmentsRef.current;
+    const historyState = { tasks: [...currentTasks], segments: [...currentSegments] };
 
-    let nextSegments: TimeSegment[] = [];
-    const affectedTaskIds = new Set<string>();
-    let trimmedCount = 0;
+    const clipped = clipOverlappingSegments(currentSegments, startTime, endTime, { now });
+    const nextSegments = [...clipped.next, newSegment];
+    const nextTasks = pauseTasksMissingOpenSegment(
+      recomputeAllDurations([...currentTasks, newTask], nextSegments, now),
+      nextSegments
+    );
 
-    segments.forEach(seg => {
-        const segEnd = seg.endTime || Date.now();
-        
-        // Check for overlap
-        if (seg.startTime < endTime && segEnd > startTime) {
-            affectedTaskIds.add(seg.taskId);
-            trimmedCount++;
-            
-            // Case 1: Fully enveloped (the existing segment is completely inside the new retro task)
-            if (seg.startTime >= startTime && segEnd <= endTime) {
-                // Completely removed. Do not push.
-            } 
-            // Case 2: The retro task splits an existing segment in half
-            else if (seg.startTime < startTime && segEnd > endTime) {
-                nextSegments.push({ ...seg, endTime: startTime });
-                nextSegments.push({ ...seg, id: crypto.randomUUID(), startTime: endTime, endTime: seg.endTime });
-            } 
-            // Case 3: Overlaps at the beginning of the retro task
-            else if (seg.startTime < startTime && segEnd <= endTime) {
-                nextSegments.push({ ...seg, endTime: startTime });
-            } 
-            // Case 4: Overlaps at the end of the retro task
-            else if (seg.startTime >= startTime && segEnd > endTime) {
-                nextSegments.push({ ...seg, startTime: endTime });
-            }
-        } else {
-            nextSegments.push(seg);
-        }
-    });
-
-    nextSegments.push(newSegment);
     setSegments(nextSegments);
+    setTasks(nextTasks);
+    segmentsRef.current = nextSegments;
+    tasksRef.current = nextTasks;
 
-    setTasks(prevTasks => {
-        let updatedTasks = prevTasks.map(t => {
-            if (affectedTaskIds.has(t.id)) {
-                // Recalculate duration from surviving segments
-                const taskSegs = nextSegments.filter(s => s.taskId === t.id);
-                const newDuration = taskSegs.reduce((acc, curr) => {
-                    const e = curr.endTime || Date.now();
-                    return acc + Math.floor((e - curr.startTime) / 1000);
-                }, 0);
-                return { ...t, totalDuration: newDuration };
-            }
-            return t;
-        });
-        return [...updatedTasks, newTask];
-    });
-
-    if (trimmedCount > 0) {
+    if (clipped.trimmedCount > 0) {
         setAiPopup({
             show: true,
-            message: `已补录任务，并自动扣除了 ${trimmedCount} 段与之重叠的时间，防止重复计算。`,
+            message: `已补录任务，并自动扣除了 ${clipped.trimmedCount} 段与之重叠的时间，防止重复计算。`,
             type: 'undo',
             undoData: historyState
         });
@@ -431,16 +475,32 @@ const App: React.FC = () => {
     setEditingTask(null);
   };
 
-  const handleUpdateSegments = (taskId: string, newSegments: TimeSegment[], newTotalDuration: number) => {
-    setSegments(prev => {
-      const otherSegments = prev.filter(s => s.taskId !== taskId);
-      return [...otherSegments, ...newSegments];
-    });
-    setTasks(prev => prev.map(t =>
-      t.id === taskId
-        ? { ...t, totalDuration: newTotalDuration }
-        : t
-    ));
+  const handleUpdateSegments = (taskId: string, newSegments: TimeSegment[], _newTotalDuration: number) => {
+    const now = Date.now();
+    const others = segmentsRef.current.filter(s => s.taskId !== taskId);
+    const preserveIds = new Set(newSegments.map(s => s.id));
+    let next = [...others, ...newSegments];
+    const affected = new Set<string>([taskId]);
+
+    for (const seg of newSegments) {
+      const end = seg.endTime ?? now;
+      if (end <= seg.startTime) continue;
+      const clipped = clipOverlappingSegments(next, seg.startTime, end, { preserveIds, now });
+      clipped.affectedTaskIds.forEach(id => affected.add(id));
+      next = [...clipped.next.filter(s => !preserveIds.has(s.id)), ...newSegments];
+    }
+
+    const nextTasks = pauseTasksMissingOpenSegment(
+      recomputeAllDurations(tasksRef.current, next, now).map(t =>
+        t.id === taskId ? { ...t, totalDuration: sumDurationForTask(next, taskId, now) } : t
+      ),
+      next
+    );
+
+    setSegments(next);
+    setTasks(nextTasks);
+    segmentsRef.current = next;
+    tasksRef.current = nextTasks;
     setEditingSegmentsTask(null);
   };
 
@@ -448,77 +508,42 @@ const App: React.FC = () => {
     if (!deletingTask) return;
     
     if (scope === 'single') {
-        setTasks(prev => prev.filter(t => t.id !== deletingTask.id));
-        setSegments(prev => prev.filter(s => s.taskId !== deletingTask.id));
+        const nextTasks = tasksRef.current.filter(t => t.id !== deletingTask.id);
+        const nextSegs = segmentsRef.current.filter(s => s.taskId !== deletingTask.id);
+        tasksRef.current = nextTasks;
+        segmentsRef.current = nextSegs;
+        setTasks(nextTasks);
+        setSegments(nextSegs);
     } else {
         const title = deletingTask.title;
-        const idsToDelete = tasks.filter(t => t.title === title).map(t => t.id);
-        setTasks(prev => prev.filter(t => t.title !== title));
-        setSegments(prev => prev.filter(s => !idsToDelete.includes(s.taskId)));
+        const idsToDelete = new Set(tasksRef.current.filter(t => t.title === title).map(t => t.id));
+        const nextTasks = tasksRef.current.filter(t => t.title !== title);
+        const nextSegs = segmentsRef.current.filter(s => !idsToDelete.has(s.taskId));
+        tasksRef.current = nextTasks;
+        segmentsRef.current = nextSegs;
+        setTasks(nextTasks);
+        setSegments(nextSegs);
     }
     setDeletingTask(null);
   };
 
   const changeTaskStatus = async (id: string, newStatus: TaskStatus) => {
     const now = Date.now();
-    
-    let taskToPauseId: string | undefined;
-    if (newStatus === TaskStatus.RUNNING) {
-       const runningTask = tasks.find(t => t.status === TaskStatus.RUNNING && t.id !== id);
-       if (runningTask) {
-           taskToPauseId = runningTask.id;
-           setInterruptedTaskId(runningTask.id); 
-       }
-    }
+    const result = applyStatusChange(tasksRef.current, segmentsRef.current, id, newStatus, now);
 
-    setSegments(prev => {
-      const updated = [...prev];
-      if (taskToPauseId) {
-          const pauseSegIndex = updated.findIndex(s => s.taskId === taskToPauseId && s.endTime === null);
-          if (pauseSegIndex !== -1) {
-              updated[pauseSegIndex] = { ...updated[pauseSegIndex], endTime: now };
-          }
-      }
-      const activeSegmentIndex = updated.findIndex(s => s.taskId === id && s.endTime === null);
-      if ((newStatus === TaskStatus.PAUSED || newStatus === TaskStatus.COMPLETED) && activeSegmentIndex !== -1) {
-        updated[activeSegmentIndex] = { ...updated[activeSegmentIndex], endTime: now };
-      }
-      if (newStatus === TaskStatus.RUNNING) {
-        updated.push({ id: crypto.randomUUID(), taskId: id, startTime: now, endTime: null });
-      }
-      return updated;
-    });
+    if (result.pausedId) setInterruptedTaskId(result.pausedId);
 
-    setTasks(prev => prev.map(t => {
-      if (taskToPauseId && t.id === taskToPauseId) {
-          const currentSeg = segments.find(s => s.taskId === taskToPauseId && s.endTime === null);
-          const added = currentSeg ? Math.floor((now - currentSeg.startTime) / 1000) : 0;
-          return { ...t, status: TaskStatus.PAUSED, totalDuration: t.totalDuration + added };
-      }
-      if (t.id === id) {
-          let addedDuration = 0;
-          if (newStatus === TaskStatus.PAUSED || newStatus === TaskStatus.COMPLETED) {
-             const activeSegment = segments.find(s => s.taskId === id && s.endTime === null);
-             if (activeSegment) {
-                 addedDuration = Math.floor((now - activeSegment.startTime) / 1000);
-             }
-          }
-          return {
-            ...t,
-            status: newStatus,
-            completedAt: newStatus === TaskStatus.COMPLETED ? now : undefined,
-            totalDuration: t.totalDuration + addedDuration
-          };
-      }
-      return t;
-    }));
+    tasksRef.current = result.tasks;
+    segmentsRef.current = result.segments;
+    setTasks(result.tasks);
+    setSegments(result.segments);
     
-    const task = tasks.find(t => t.id === id);
+    const task = result.tasks.find(t => t.id === id);
     if (newStatus === TaskStatus.COMPLETED && task) {
        playSound('complete');
        if (task.recurrence !== RecurrenceType.NONE) handleRecurrence(task);
        if (interruptedTaskId && interruptedTaskId !== id) {
-           const prevTask = tasks.find(t => t.id === interruptedTaskId);
+           const prevTask = result.tasks.find(t => t.id === interruptedTaskId);
            if (prevTask && prevTask.status !== TaskStatus.COMPLETED) {
                setResumeTask(prevTask);
            } else {
@@ -537,7 +562,10 @@ const App: React.FC = () => {
     do {
       if (task.recurrence === RecurrenceType.DAILY) nextDate.setDate(nextDate.getDate() + 1);
       else if (task.recurrence === RecurrenceType.WEEKLY) nextDate.setDate(nextDate.getDate() + 7);
-      else if (task.recurrence === RecurrenceType.MONTHLY) nextDate.setMonth(nextDate.getMonth() + 1);
+      else if (task.recurrence === RecurrenceType.MONTHLY) {
+        const shifted = addMonthsClamped(nextDate, 1);
+        nextDate.setTime(shifted.getTime());
+      }
       else break;
     } while (nextDate.getTime() <= Date.now());
 
@@ -551,7 +579,9 @@ const App: React.FC = () => {
       completedAt: undefined,
       lastRemindedAt: undefined
     };
-    setTasks(prev => [...prev, nextTask]);
+    const withNext = [...tasksRef.current, nextTask];
+    tasksRef.current = withNext;
+    setTasks(withNext);
   };
 
   // --- API Command Dispatcher Listener ---
@@ -570,7 +600,7 @@ const App: React.FC = () => {
             settings: {
               model: 'gemini-2.5-flash',
               timezone,
-              autoBackupInterval: 1,
+              autoBackupInterval,
               enableApiServer: true,
               apiPort: 3618
             },
@@ -592,7 +622,7 @@ const App: React.FC = () => {
         };
       } catch (e) {}
     }
-  }, [tasks, tags, segments, timezone]);
+  }, [tasks, tags, segments, timezone, autoBackupInterval]);
 
   const snoozeTask = () => {
       if (!aiPopup?.relatedTaskId) return;
@@ -607,18 +637,7 @@ const App: React.FC = () => {
   };
 
   const getLocalDateString = (dateInput: string | Date, tz: string) => {
-    try {
-      const formatted = new Intl.DateTimeFormat('en-CA', {
-        timeZone: tz,
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit'
-      }).format(new Date(dateInput));
-      return formatted; // en-CA format is YYYY-MM-DD
-    } catch {
-      const d = new Date(dateInput);
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    }
+    return getDateStringInZone(dateInput, tz);
   };
 
   const getDayGroup = (dateStr: string) => {
@@ -679,6 +698,10 @@ const App: React.FC = () => {
               segments={segments}
               onImportData={handleImportData}
               onClearData={handleClearData}
+              onSettingsChange={(next) => {
+                setTimezone(next.timezone);
+                setAutoBackupInterval(next.autoBackupInterval || 1);
+              }}
           />
       )}
 
@@ -928,7 +951,7 @@ const App: React.FC = () => {
           )}
 
           {activeTab === 'timeline' && (
-              <DailyTimeline tasks={tasks} segments={segments} tags={tags} />
+              <DailyTimeline tasks={tasks} segments={segments} tags={tags} timezone={timezone} />
           )}
 
           {activeTab === 'worldclock' && (
@@ -937,12 +960,12 @@ const App: React.FC = () => {
 
           {activeTab === 'heatmap' && (
             <div className="max-w-5xl mx-auto">
-              <WeeklyHeatmap segments={segments} tasks={tasks} tags={tags} />
+              <WeeklyHeatmap segments={segments} tasks={tasks} tags={tags} timezone={timezone} />
             </div>
           )}
           
           {activeTab === 'analytics' && (
-            <AnalyticsView tasks={tasks} tags={tags} segments={segments} />
+            <AnalyticsView tasks={tasks} tags={tags} segments={segments} timezone={timezone} />
           )}
         </div>
 
@@ -957,13 +980,16 @@ const App: React.FC = () => {
             <i className="fa-solid fa-clock-rotate-left text-white"></i>
           </div>
           <div className="flex-1">
-             <h4 className="font-bold text-white text-sm mb-1">时间轴已调整</h4>
+             <h4 className="font-bold text-white text-sm mb-1">{aiPopup.undoData ? '时间轴已调整' : '计时已恢复'}</h4>
              <p className="text-sm text-slate-300 mb-3">{aiPopup.message}</p>
+             {aiPopup.undoData && (
              <button 
                  onClick={() => {
                      if (aiPopup.undoData) {
                          setTasks(aiPopup.undoData.tasks);
                          setSegments(aiPopup.undoData.segments);
+                         tasksRef.current = aiPopup.undoData.tasks;
+                         segmentsRef.current = aiPopup.undoData.segments;
                          setAiPopup(null);
                      }
                  }}
@@ -971,6 +997,7 @@ const App: React.FC = () => {
              >
                  <i className="fa-solid fa-rotate-left mr-1"></i> 撤销调整
              </button>
+             )}
           </div>
           <button onClick={() => setAiPopup(null)} className="text-slate-500 hover:text-white self-start">
             <i className="fa-solid fa-xmark"></i>

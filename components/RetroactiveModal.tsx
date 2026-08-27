@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Tag } from '../types';
+import { addDaysToDateStr, parseLocalDateTime, toLocalDateStr, toLocalTimeStr } from '../utils/timeUtils';
 
 interface RetroactiveModalProps {
   tags: Tag[];
@@ -7,27 +8,41 @@ interface RetroactiveModalProps {
   onClose: () => void;
 }
 
+const MINUTE_CHIPS = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55];
+
+const HOUR_BANDS: { label: string; hours: number[]; cls: string }[] = [
+  { label: '凌晨', hours: [0, 1, 2, 3, 4, 5], cls: 'text-slate-400' },
+  { label: '上午', hours: [6, 7, 8, 9, 10, 11], cls: 'text-orange-400' },
+  { label: '下午', hours: [12, 13, 14, 15, 16, 17], cls: 'text-sky-400' },
+  { label: '晚上', hours: [18, 19, 20, 21, 22, 23], cls: 'text-indigo-400' },
+];
+
+function ensureEndAfterStart(startDate: string, startTime: string, endDate: string, endTime: string) {
+  const startMs = parseLocalDateTime(startDate, startTime).getTime();
+  let nextEndDate = endDate;
+  let crossed = false;
+  let guard = 0;
+  while (parseLocalDateTime(nextEndDate, endTime).getTime() <= startMs && guard < 7) {
+    nextEndDate = addDaysToDateStr(nextEndDate, 1);
+    crossed = true;
+    guard++;
+  }
+  return { endDate: nextEndDate, crossed };
+}
+
 export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, onSave, onClose }) => {
-  const getLocalDateStr = (d: Date) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-  const getLocalTimeStr = (d: Date) => String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  const now = new Date();
+  const startDefault = new Date(now.getTime() - 30 * 60 * 1000);
 
   const [title, setTitle] = useState('');
   const [tagId, setTagId] = useState(tags[0]?.id || '');
-  const [startDate, setStartDate] = useState(getLocalDateStr(new Date()));
-  const [endDate, setEndDate] = useState(getLocalDateStr(new Date()));
-  const [startTime, setStartTime] = useState(getLocalTimeStr(new Date()));
-  const [endTime, setEndTime] = useState(getLocalTimeStr(new Date()));
+  const [startDate, setStartDate] = useState(toLocalDateStr(startDefault));
+  const [endDate, setEndDate] = useState(toLocalDateStr(now));
+  const [startTime, setStartTime] = useState(toLocalTimeStr(startDefault));
+  const [endTime, setEndTime] = useState(toLocalTimeStr(now));
   const [description, setDescription] = useState('');
-  
   const [editingTarget, setEditingTarget] = useState<'start' | 'end'>('start');
-
-  // Auto-sync end date if start date changes and end date was earlier
-  const handleStartDateChange = (newDate: string) => {
-      setStartDate(newDate);
-      if (new Date(endDate) < new Date(newDate)) {
-          setEndDate(newDate);
-      }
-  };
+  const [crossedNight, setCrossedNight] = useState(startDefault.getDate() !== now.getDate());
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -37,6 +52,21 @@ export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, onSave
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [onClose]);
 
+  const applyStart = (nextDate: string, nextTime: string) => {
+    const synced = ensureEndAfterStart(nextDate, nextTime, endDate, endTime);
+    setStartDate(nextDate);
+    setStartTime(nextTime);
+    setEndDate(synced.endDate);
+    setCrossedNight(synced.crossed);
+  };
+
+  const applyEnd = (nextDate: string, nextTime: string) => {
+    const synced = ensureEndAfterStart(startDate, startTime, nextDate, nextTime);
+    setEndDate(synced.endDate);
+    setEndTime(nextTime);
+    setCrossedNight(synced.crossed);
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim()) {
@@ -44,11 +74,12 @@ export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, onSave
         return;
     }
 
-    const startObj = new Date(`${startDate}T${startTime}`);
-    const endObj = new Date(`${endDate}T${endTime}`);
+    const synced = ensureEndAfterStart(startDate, startTime, endDate, endTime);
+    const startObj = parseLocalDateTime(startDate, startTime);
+    const endObj = parseLocalDateTime(synced.endDate, endTime);
 
     if (endObj.getTime() <= startObj.getTime()) {
-        alert("结束时间必须晚于开始时间！如果跨天了，请修改结束日期。");
+        alert("结束时间必须晚于开始时间。");
         return;
     }
 
@@ -56,74 +87,53 @@ export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, onSave
   };
 
   const getDurationPreview = () => {
-    const start = new Date(`${startDate}T${startTime}`).getTime();
-    const end = new Date(`${endDate}T${endTime}`).getTime();
-    
-    if (end <= start) return "时间无效";
-
+    const synced = ensureEndAfterStart(startDate, startTime, endDate, endTime);
+    const start = parseLocalDateTime(startDate, startTime).getTime();
+    const end = parseLocalDateTime(synced.endDate, endTime).getTime();
+    if (end <= start) return { text: '时间无效', minutes: 0 };
     const diffMin = Math.floor((end - start) / 60000);
     const h = Math.floor(diffMin / 60);
     const m = diffMin % 60;
-    return `${h}小时 ${m}分钟`;
+    return { text: `${h}小时 ${m}分钟`, minutes: diffMin };
   };
 
-  // Generate last 3 days
-  const last3Days = Array.from({length: 3}).map((_, i) => {
+  const last3Days = Array.from({ length: 3 }).map((_, i) => {
       const d = new Date();
       d.setDate(d.getDate() - (2 - i));
       return d;
   });
 
-  const datesScrollRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-      // scroll to rightmost (latest date) on mount
-      if (datesScrollRef.current) {
-          datesScrollRef.current.scrollLeft = datesScrollRef.current.scrollWidth;
-      }
-  }, [editingTarget]); // scroll when target changes
-
   const activeDate = editingTarget === 'start' ? startDate : endDate;
   const activeTime = editingTarget === 'start' ? startTime : endTime;
-  
+  const activeHour = parseInt(activeTime.split(':')[0], 10) || 0;
+  const activeMinute = parseInt(activeTime.split(':')[1], 10) || 0;
+
   const handleDateClick = (dStr: string) => {
-      if (editingTarget === 'start') handleStartDateChange(dStr);
-      else setEndDate(dStr);
+      if (editingTarget === 'start') applyStart(dStr, startTime);
+      else applyEnd(dStr, endTime);
   };
-
-  const handleTimeChange = (newTime: string) => {
-      if (editingTarget === 'start') setStartTime(newTime);
-      else setEndTime(newTime);
-  };
-
-  const activeHour = parseInt(activeTime.split(':')[0]);
-  const activeMinute = parseInt(activeTime.split(':')[1]);
-  const isPM = activeHour >= 12;
-  const displayHour12 = activeHour === 0 ? 12 : (activeHour > 12 ? activeHour - 12 : activeHour);
 
   const handleHourClick = (h: number) => {
-      const mmStr = String(activeMinute).padStart(2, '0');
-      let newH24 = isPM ? (h === 12 ? 12 : h + 12) : (h === 12 ? 0 : h);
-      handleTimeChange(`${String(newH24).padStart(2, '0')}:${mmStr}`);
+      const next = `${String(h).padStart(2, '0')}:${String(activeMinute).padStart(2, '0')}`;
+      if (editingTarget === 'start') applyStart(startDate, next);
+      else applyEnd(endDate, next);
   };
 
-  const handleMinuteClick = (m: number) => {
-      const hhStr = String(activeHour).padStart(2, '0');
-      handleTimeChange(`${hhStr}:${String(m).padStart(2, '0')}`);
-  };
-
-  const handlePMToggle = (pm: boolean) => {
-      if (isPM === pm) return;
-      let newH = activeHour;
-      if (pm) newH += 12;
-      else newH -= 12;
-      handleTimeChange(`${String(newH).padStart(2, '0')}:${String(activeMinute).padStart(2, '0')}`);
+  const handleMinuteChange = (m: number) => {
+      const clamped = Math.max(0, Math.min(59, Number.isFinite(m) ? m : 0));
+      const next = `${String(activeHour).padStart(2, '0')}:${String(clamped).padStart(2, '0')}`;
+      if (editingTarget === 'start') applyStart(startDate, next);
+      else applyEnd(endDate, next);
   };
 
   const setNow = () => {
       const d = new Date();
-      handleDateClick(getLocalDateStr(d));
-      handleTimeChange(getLocalTimeStr(d));
+      if (editingTarget === 'start') applyStart(toLocalDateStr(d), toLocalTimeStr(d));
+      else applyEnd(toLocalDateStr(d), toLocalTimeStr(d));
   };
+
+  const duration = getDurationPreview();
+  const displayEndDate = ensureEndAfterStart(startDate, startTime, endDate, endTime).endDate;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fade-in">
@@ -168,7 +178,6 @@ export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, onSave
                 </div>
             </div>
 
-            {/* Time Selection Header (Tabs) */}
             <div className="flex gap-4 p-1 bg-slate-800/50 rounded-xl border border-slate-700/50">
                 <button 
                     type="button"
@@ -187,11 +196,11 @@ export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, onSave
                     className={`flex-1 p-3 rounded-lg flex flex-col items-center justify-center transition-all ${editingTarget === 'end' ? 'bg-purple-600 text-white shadow-lg shadow-purple-900/20' : 'text-slate-400 hover:bg-slate-800'}`}
                 >
                     <span className="text-[10px] uppercase font-bold opacity-80 mb-1">结束时间</span>
-                    <span className="font-mono text-lg">{endDate} {endTime}</span>
+                    <span className="font-mono text-lg">{displayEndDate} {endTime}</span>
+                    {crossedNight && <span className="text-[10px] mt-1 text-amber-300">跨夜</span>}
                 </button>
             </div>
 
-            {/* Expanded Custom Picker */}
             <div className="bg-slate-800 border border-slate-700 rounded-xl p-4 space-y-4">
                 <div className="flex justify-between items-center">
                     <h3 className="text-sm font-bold text-white flex items-center gap-2">
@@ -202,10 +211,9 @@ export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, onSave
                     </button>
                 </div>
                 
-                {/* 3 Days Selection */}
-                <div ref={datesScrollRef} className="flex gap-2 pb-2">
+                <div className="flex gap-2">
                     {last3Days.map((d, index) => {
-                        const dStr = getLocalDateStr(d);
+                        const dStr = toLocalDateStr(d);
                         const isSelected = activeDate === dStr;
                         const labelName = index === 2 ? '今天' : (index === 1 ? '昨天' : '前天');
                         return (
@@ -223,60 +231,68 @@ export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, onSave
                     })}
                 </div>
 
-                <div className="border-t border-slate-700/50 pt-4">
-                    <h3 className="text-sm font-bold text-white flex items-center gap-2 mb-3">
-                        <i className="fa-regular fa-clock text-blue-400"></i> 选择具体时间
-                    </h3>
-                    
-                    <div className="flex flex-col gap-4">
-                        {/* AM / PM */}
-                        <div className="flex gap-2">
-                            <button type="button" onClick={() => handlePMToggle(false)} className={`flex-1 py-2 rounded-lg font-bold text-sm border transition-all ${!isPM ? 'bg-orange-500/20 border-orange-500 text-orange-400' : 'bg-slate-900 border-slate-700 text-slate-500 hover:border-slate-500'}`}>
-                                <i className="fa-regular fa-sun mr-1"></i> 上午 (AM)
-                            </button>
-                            <button type="button" onClick={() => handlePMToggle(true)} className={`flex-1 py-2 rounded-lg font-bold text-sm border transition-all ${isPM ? 'bg-indigo-500/20 border-indigo-500 text-indigo-400' : 'bg-slate-900 border-slate-700 text-slate-500 hover:border-slate-500'}`}>
-                                <i className="fa-solid fa-moon mr-1"></i> 下午 (PM)
-                            </button>
-                        </div>
+                <div className="flex items-center gap-2">
+                    <span className="text-xs text-slate-500 shrink-0">更早日期</span>
+                    <input
+                        type="date"
+                        value={activeDate}
+                        onChange={(e) => { if (e.target.value) handleDateClick(e.target.value); }}
+                        className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 outline-none focus:border-blue-500"
+                    />
+                </div>
 
-                        {/* Hours */}
-                        <div>
-                            <div className="text-xs text-slate-500 mb-2 font-bold">小时</div>
+                <div className="border-t border-slate-700/50 pt-4 space-y-4">
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                        <i className="fa-regular fa-clock text-blue-400"></i> 选择具体时间（24 小时）
+                    </h3>
+
+                    {HOUR_BANDS.map(band => (
+                        <div key={band.label}>
+                            <div className={`text-[10px] font-bold mb-1.5 ${band.cls}`}>{band.label}</div>
                             <div className="grid grid-cols-6 gap-2">
-                                {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(h => {
-                                    const isSelected = displayHour12 === h;
+                                {band.hours.map(h => {
+                                    const isSelected = activeHour === h;
                                     return (
-                                        <button 
-                                            key={`h-${h}`} 
+                                        <button
+                                            key={`h-${h}`}
                                             type="button"
                                             onClick={() => handleHourClick(h)}
                                             className={`py-2 rounded-lg text-sm font-bold border transition-all ${isSelected ? 'bg-blue-600 border-blue-500 text-white shadow-lg' : 'bg-slate-900 border-slate-700 text-slate-400 hover:bg-slate-800'}`}
                                         >
-                                            {h}
+                                            {String(h).padStart(2, '0')}
                                         </button>
                                     );
                                 })}
                             </div>
                         </div>
+                    ))}
 
-                        {/* Minutes */}
-                        <div>
-                            <div className="text-xs text-slate-500 mb-2 font-bold">分钟</div>
-                            <div className="grid grid-cols-10 gap-1">
-                                {Array.from({ length: 60 }).map((_, m) => {
-                                    const isSelected = activeMinute === m;
-                                    return (
-                                        <button 
-                                            key={`m-${m}`} 
-                                            type="button"
-                                            onClick={() => handleMinuteClick(m)}
-                                            className={`py-1 rounded cursor-pointer text-xs font-bold border transition-all ${isSelected ? 'bg-purple-600 border-purple-500 text-white shadow-lg scale-110 z-10' : 'bg-slate-900 border-slate-700 text-slate-400 hover:bg-slate-800'}`}
-                                        >
-                                            {String(m).padStart(2, '0')}
-                                        </button>
-                                    );
-                                })}
+                    <div>
+                        <div className="flex items-center justify-between mb-2">
+                            <div className="text-xs text-slate-500 font-bold">分钟</div>
+                            <div className="flex items-center gap-2">
+                                <input
+                                    type="number"
+                                    min={0}
+                                    max={59}
+                                    value={activeMinute}
+                                    onChange={(e) => handleMinuteChange(parseInt(e.target.value, 10))}
+                                    className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-sm text-white text-center outline-none focus:border-blue-500 font-mono"
+                                />
+                                <span className="text-xs text-slate-500">可直接输入 0–59</span>
                             </div>
+                        </div>
+                        <div className="grid grid-cols-12 gap-1">
+                            {MINUTE_CHIPS.map(m => (
+                                <button
+                                    key={`m-${m}`}
+                                    type="button"
+                                    onClick={() => handleMinuteChange(m)}
+                                    className={`py-1 rounded text-[10px] font-bold border transition-all ${activeMinute === m ? 'bg-purple-600 border-purple-500 text-white' : 'bg-slate-900 border-slate-700 text-slate-400 hover:bg-slate-800'}`}
+                                >
+                                    {String(m).padStart(2, '0')}
+                                </button>
+                            ))}
                         </div>
                     </div>
                 </div>
@@ -295,9 +311,17 @@ export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, onSave
         </div>
 
         <div className="pt-4 mt-4 border-t border-slate-800 flex justify-between items-center shrink-0">
-             <span className="text-sm text-green-400 font-mono bg-green-900/20 px-3 py-1.5 rounded-lg border border-green-500/20">
-                 总计: {getDurationPreview()}
-             </span>
+             <div className="flex flex-col gap-1">
+                <span className={`text-sm font-mono px-3 py-1.5 rounded-lg border ${duration.minutes > 6 * 60 ? 'text-amber-300 bg-amber-900/20 border-amber-500/20' : 'text-green-400 bg-green-900/20 border-green-500/20'}`}>
+                    总计: {duration.text}
+                </span>
+                {crossedNight && (
+                    <span className="text-[11px] text-amber-400 px-1">结束早于开始，已自动把结束日期 +1 天（跨夜）</span>
+                )}
+                {duration.minutes > 6 * 60 && (
+                    <span className="text-[11px] text-amber-400/80 px-1">超过 6 小时，请确认不是忘了改结束时间</span>
+                )}
+             </div>
              <div className="flex gap-3">
                 <button 
                 type="button" 

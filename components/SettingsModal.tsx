@@ -10,11 +10,12 @@ interface SettingsModalProps {
   segments?: TimeSegment[];
   onImportData?: (data: any) => void;
   onClearData?: () => void;
+  onSettingsChange?: (settings: AppSettings) => void;
 }
 
 const STORAGE_KEY = 'mindflow_settings_v7';
 
-export const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, tasks, tags, segments, onImportData, onClearData }) => {
+export const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, tasks, tags, segments, onImportData, onClearData, onSettingsChange }) => {
   const [timezone, setTimezone] = useState(Intl.DateTimeFormat().resolvedOptions().timeZone);
   const [autoBackupInterval, setAutoBackupInterval] = useState(1);
   const [clearConfirm, setClearConfirm] = useState(false);
@@ -63,6 +64,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, tasks, ta
       apiToken: apiToken
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    onSettingsChange?.(settings);
 
     // Notify Electron main process about updated API server config
     if (typeof window !== 'undefined' && (window as any).require) {

@@ -109,7 +109,7 @@ class ApiServer {
     // Health check endpoint
     if (pathname === '/api/v1/health' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ status: 'ok', version: '1.0.21', apiVersion: 'v1', serverTime: new Date().toISOString() }));
+      res.end(JSON.stringify({ status: 'ok', version: '1.0.22', apiVersion: 'v1', serverTime: new Date().toISOString() }));
       return;
     }
 

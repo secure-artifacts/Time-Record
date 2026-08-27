@@ -35,10 +35,25 @@ export const EditSegmentsModal: React.FC<EditSegmentsModalProps> = ({ task, segm
   };
 
   const handleSave = () => {
-    // Calculate new total duration
+    for (const seg of localSegments) {
+        const end = seg.endTime ?? Date.now();
+        if (end <= seg.startTime) {
+            alert('每个时间段的结束时间必须晚于开始时间。');
+            return;
+        }
+    }
+
+    const sorted = [...localSegments].sort((a, b) => a.startTime - b.startTime);
+    for (let i = 1; i < sorted.length; i++) {
+        const prevEnd = sorted[i - 1].endTime ?? Date.now();
+        if (sorted[i].startTime < prevEnd) {
+            alert('同一任务的时间段之间不能重叠。请先改开，再保存。');
+            return;
+        }
+    }
+
     const newTotalDuration = localSegments.reduce((acc, curr) => {
         const end = curr.endTime || Date.now();
-        // Prevent negative duration if start > end somehow
         const duration = Math.max(0, Math.floor((end - curr.startTime) / 1000));
         return acc + duration;
     }, 0);

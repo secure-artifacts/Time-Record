@@ -186,9 +186,24 @@ export const SmartBar: React.FC<SmartBarProps> = ({ onAdd, timezone, tags }) => 
                    </div>
                </div>
                <div>
-                   <div className="text-[9px] text-slate-500 font-bold mb-1">分钟</div>
-                   <div className="grid grid-cols-4 gap-2">
-                        {[0, 15, 30, 45].map(m => (
+                   <div className="flex items-center justify-between mb-1">
+                       <div className="text-[9px] text-slate-500 font-bold">分钟</div>
+                       <input
+                           type="number"
+                           min={0}
+                           max={59}
+                           value={selectedDate.getMinutes()}
+                           onChange={(e) => {
+                               const m = Math.max(0, Math.min(59, parseInt(e.target.value, 10) || 0));
+                               const d = new Date(selectedDate);
+                               d.setMinutes(m);
+                               setSelectedDate(d);
+                           }}
+                           className="w-12 bg-slate-900 border border-slate-600 rounded px-1 py-0.5 text-[10px] text-white text-center outline-none focus:border-blue-500 font-mono"
+                       />
+                   </div>
+                   <div className="grid grid-cols-6 gap-1">
+                        {[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55].map(m => (
                         <button key={m} type="button" onClick={() => { const d = new Date(selectedDate); d.setMinutes(m); setSelectedDate(d); }} className={`py-1 text-[10px] rounded border ${selectedDate.getMinutes() === m ? 'bg-slate-200 text-slate-900 border-white font-bold' : 'border-slate-600 text-slate-400 hover:border-slate-500'}`}>:{m.toString().padStart(2, '0')}</button>
                         ))}
                    </div>

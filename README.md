@@ -31,15 +31,21 @@
 ## 🛠️ 如何使用？
 
 ### 📥 方式一：下载免安装 / 安装版 (推荐)
-1. 前往 GitHub 项目右侧的 **[Releases](https://github.com/nuosishizi/Time-Record/releases)** 页面。
+1. 前往 GitHub 项目右侧的 **[Releases](https://github.com/secure-artifacts/Time-Record/releases)** 页面。
 2. 下载最新版本中的 `.exe` 安装包。
 3. 双击运行即可使用。
+
+下载后可用 GitHub CLI 验证安装包确实由官方 CI 构建：
+
+```bash
+gh attestation verify ./MindFlow*.exe --repo secure-artifacts/Time-Record
+```
 
 ### 💻 方式二：面向开发者的本地构建
 如果您想自己修改代码或体验最新功能：
 ```bash
 # 1. 克隆项目
-git clone https://github.com/nuosishizi/Time-Record.git
+git clone https://github.com/secure-artifacts/Time-Record.git
 
 # 2. 进入目录并安装依赖
 cd Time-Record

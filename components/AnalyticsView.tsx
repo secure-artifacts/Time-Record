@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { Tag, Task, TimeSegment } from '../types';
+import { splitRangeByZonedDays, weekdayLabel } from '../utils/timeUtils';
 
 interface AnalyticsViewProps {
   tasks: Task[];
   tags: Tag[];
   segments: TimeSegment[];
+  timezone: string;
 }
 
 interface DailyStat {
@@ -13,14 +15,14 @@ interface DailyStat {
     tagBreakdown: Record<string, number>; // tagId -> seconds
 }
 
-export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ tasks, tags, segments }) => {
+export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ tasks, tags, segments, timezone }) => {
   const [stats, setStats] = useState<{tagId: string, duration: number, percentage: number}[]>([]);
   const [dailyStats, setDailyStats] = useState<DailyStat[]>([]);
 
   useEffect(() => {
     calculateStats();
     calculateDailyTrends();
-  }, [tasks, segments, tags]);
+  }, [tasks, segments, tags, timezone]);
 
   const calculateStats = async () => {
     // 1. Calculate duration per tag (Overall)
@@ -45,30 +47,23 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ tasks, tags, segme
   };
 
   const calculateDailyTrends = () => {
-      // Group segments by day
       const days: Record<string, DailyStat> = {};
+      const now = Date.now();
 
       segments.forEach(seg => {
-          const date = new Date(seg.startTime);
-          const dateStr = date.toISOString().split('T')[0];
           const task = tasks.find(t => t.id === seg.taskId);
-          
-          if (!days[dateStr]) {
-              days[dateStr] = { dateStr, totalSeconds: 0, tagBreakdown: {} };
-          }
+          if (!task) return;
 
-          let duration = 0;
-          if (seg.endTime) {
-              duration = Math.floor((seg.endTime - seg.startTime) / 1000);
-          } else {
-              // Current running segment
-              duration = Math.floor((Date.now() - seg.startTime) / 1000);
-          }
-          
-          if (duration > 0 && task) {
-             days[dateStr].totalSeconds += duration;
-             days[dateStr].tagBreakdown[task.tagId] = (days[dateStr].tagBreakdown[task.tagId] || 0) + duration;
-          }
+          splitRangeByZonedDays(seg.startTime, seg.endTime ?? now, timezone).forEach(slice => {
+              const duration = Math.floor(slice.durationMs / 1000);
+              if (duration <= 0) return;
+              if (!days[slice.dateStr]) {
+                  days[slice.dateStr] = { dateStr: slice.dateStr, totalSeconds: 0, tagBreakdown: {} };
+              }
+              days[slice.dateStr].totalSeconds += duration;
+              days[slice.dateStr].tagBreakdown[task.tagId] =
+                (days[slice.dateStr].tagBreakdown[task.tagId] || 0) + duration;
+          });
       });
 
       // Convert to array and sort by date descending (last 7 days maybe)
@@ -123,8 +118,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ tasks, tags, segme
         </h3>
         <div className="space-y-4">
              {dailyStats.map(day => {
-                 const date = new Date(day.dateStr);
-                 const weekDay = date.toLocaleDateString('zh-CN', { weekday: 'short' });
+                 const weekDay = weekdayLabel(day.dateStr);
                  
                  // Sort breakdown items by duration desc
                  const breakdownItems = Object.entries(day.tagBreakdown)

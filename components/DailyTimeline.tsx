@@ -1,19 +1,25 @@
 
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { TimeSegment, Task, Tag } from '../types';
+import {
+  addDaysToDateStr,
+  formatDateLabel,
+  formatTimeInZone,
+  getDateStringInZone,
+  splitRangeByZonedDays,
+} from '../utils/timeUtils';
 
 interface DailyTimelineProps {
   tasks: Task[];
   segments: TimeSegment[];
   tags: Tag[];
+  timezone: string;
 }
 
-export const DailyTimeline: React.FC<DailyTimelineProps> = ({ tasks, segments, tags }) => {
-  const getLocalDateString = (date: Date) => {
-    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-  };
+export const DailyTimeline: React.FC<DailyTimelineProps> = ({ tasks, segments, tags, timezone }) => {
+  const getLocalDateString = (date: Date) => getDateStringInZone(date, timezone);
 
-  const [selectedDate, setSelectedDate] = useState(getLocalDateString(new Date()));
+  const [selectedDate, setSelectedDate] = useState(() => getDateStringInZone(new Date(), timezone));
   const [calDate, setCalDate] = useState(new Date());
   const [daysToRender, setDaysToRender] = useState(14); // Load last 14 days initially
   
@@ -28,79 +34,79 @@ export const DailyTimeline: React.FC<DailyTimelineProps> = ({ tasks, segments, t
 
   const daysWithData = useMemo(() => {
       const set = new Set<string>();
+      const now = Date.now();
       segments.forEach(seg => {
-          set.add(getLocalDateString(new Date(seg.startTime)));
+          splitRangeByZonedDays(seg.startTime, seg.endTime ?? now, timezone).forEach(slice => {
+              set.add(slice.dateStr);
+          });
       });
       return set;
-  }, [segments]);
+  }, [segments, timezone]);
 
   // Generate a continuous list of dates to render (OLDEST TO NEWEST)
   const continuousDaysList = useMemo(() => {
-      const today = new Date();
-      today.setHours(0,0,0,0);
-      const list = Array.from({ length: daysToRender }, (_, i) => {
-          const d = new Date(today.getTime() - i * 24 * 3600 * 1000);
-          return getLocalDateString(d);
-      });
-      // Reverse to show oldest days at the top, newest days (today) at the bottom
+      const todayStr = getDateStringInZone(new Date(), timezone);
+      const list = Array.from({ length: daysToRender }, (_, i) => addDaysToDateStr(todayStr, -i));
       return list.reverse();
-  }, [daysToRender]);
+  }, [daysToRender, timezone]);
 
   const [searchQuery, setSearchQuery] = useState('');
 
   // Group all segments by Date
   const groupedTimeline = useMemo(() => {
     const groups: Record<string, any[]> = {};
+    const now = Date.now();
     
     segments.forEach(seg => {
         const task = tasks.find(t => t.id === seg.taskId);
         const tag = tags.find(t => t.id === task?.tagId);
-        const start = new Date(seg.startTime);
-        const end = seg.endTime ? new Date(seg.endTime) : new Date(); 
-        const durationMin = Math.floor((end.getTime() - start.getTime()) / 60000);
-        
-        const dateStr = getLocalDateString(start);
-        
-        const item = {
-            id: seg.id,
-            taskTitle: task?.title || 'Unknown Task',
-            tagName: tag?.name || 'Uncategorized',
-            tagColor: tag?.color || 'bg-slate-600',
-            startTime: start.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
-            endTime: seg.endTime ? end.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '进行中...',
-            duration: durationMin,
-            isRunning: !seg.endTime,
-            startTimestamp: start.getTime()
-        };
+        const slices = splitRangeByZonedDays(seg.startTime, seg.endTime ?? now, timezone);
+        const lastSliceIndex = slices.length - 1;
 
-        if (searchQuery) {
-            if (!item.taskTitle.toLowerCase().includes(searchQuery.toLowerCase()) && 
-                !item.tagName.toLowerCase().includes(searchQuery.toLowerCase())) {
-                return; // Skip if it doesn't match the search
+        slices.forEach((slice, index) => {
+            const durationMin = Math.max(1, Math.round(slice.durationMs / 60000));
+            const isLast = index === lastSliceIndex;
+            const item = {
+                id: `${seg.id}-${slice.dateStr}`,
+                taskTitle: task?.title || 'Unknown Task',
+                tagName: tag?.name || 'Uncategorized',
+                tagColor: tag?.color || 'bg-slate-600',
+                startTime: formatTimeInZone(slice.start, timezone),
+                endTime: !seg.endTime && isLast ? '进行中...' : formatTimeInZone(slice.end, timezone),
+                duration: durationMin,
+                isRunning: !seg.endTime && isLast,
+                startTimestamp: slice.start
+            };
+
+            if (searchQuery) {
+                if (!item.taskTitle.toLowerCase().includes(searchQuery.toLowerCase()) && 
+                    !item.tagName.toLowerCase().includes(searchQuery.toLowerCase())) {
+                    return;
+                }
             }
-        }
 
-        if (!groups[dateStr]) groups[dateStr] = [];
-        groups[dateStr].push(item);
+            if (!groups[slice.dateStr]) groups[slice.dateStr] = [];
+            groups[slice.dateStr].push(item);
+        });
     });
 
     Object.keys(groups).forEach(k => {
-        // Sort items chronologically within the day (morning -> evening)
         groups[k].sort((a, b) => a.startTimestamp - b.startTimestamp);
     });
 
     return groups;
-  }, [segments, tasks, tags, searchQuery]);
+  }, [segments, tasks, tags, searchQuery, timezone]);
 
   const scrollToDate = (dateStr: string) => {
       setSelectedDate(dateStr);
       
       // If the date is older than what we currently render, expand the render limit
-      const today = new Date();
-      today.setHours(0,0,0,0);
-      const targetDate = new Date(dateStr);
-      targetDate.setHours(0,0,0,0);
-      const diffDays = Math.floor((today.getTime() - targetDate.getTime()) / (24*3600*1000));
+      const todayStr = getDateStringInZone(new Date(), timezone);
+      const [ty, tm, td] = todayStr.split('-').map(Number);
+      const [sy, sm, sd] = dateStr.split('-').map(Number);
+      const diffDays = Math.round(
+        (new Date(ty, tm - 1, td).getTime() - new Date(sy, sm - 1, sd).getTime()) / (24 * 3600 * 1000)
+      );
       
       if (diffDays >= daysToRender) {
           setDaysToRender(diffDays + 14);
@@ -281,7 +287,7 @@ export const DailyTimeline: React.FC<DailyTimelineProps> = ({ tasks, segments, t
                         <div className="sticky top-0 bg-slate-900/95 backdrop-blur z-20 py-4 mb-6 border-b border-slate-800/50 flex justify-between items-center">
                             <h2 className="text-lg font-bold text-white flex items-center gap-3">
                                 <i className="fa-solid fa-stopwatch text-blue-400"></i> 
-                                {new Date(dateStr).toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })}
+                                {formatDateLabel(dateStr)}
                             </h2>
                             {items.length === 0 && (
                                 <span className="text-xs text-slate-500 bg-slate-800 px-3 py-1 rounded-full">无记录</span>
