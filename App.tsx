@@ -708,6 +708,7 @@ const App: React.FC = () => {
       {showRetroactive && (
         <RetroactiveModal
             tags={tags}
+            timezone={timezone}
             onSave={addRetroactiveTask}
             onClose={() => setShowRetroactive(false)}
         />
