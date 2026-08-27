@@ -45,8 +45,15 @@ export interface ZonedParts {
   second: number;
 }
 
-export const getZonedParts = (date: Date, timezone: string): ZonedParts => {
-  const parts = new Intl.DateTimeFormat('en-US', {
+// Constructing Intl formatters inside every boundary-search iteration stalls the
+// renderer on real histories. Reuse immutable formatters, with a bounded cache
+// because users can change timezones throughout a long-running desktop session.
+const zonedPartsFormatters = new Map<string, Intl.DateTimeFormat>();
+
+const getZonedPartsFormatter = (timezone: string): Intl.DateTimeFormat => {
+  const cached = zonedPartsFormatters.get(timezone);
+  if (cached) return cached;
+  const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: timezone,
     year: 'numeric',
     month: '2-digit',
@@ -55,7 +62,16 @@ export const getZonedParts = (date: Date, timezone: string): ZonedParts => {
     minute: '2-digit',
     second: '2-digit',
     hourCycle: 'h23',
-  }).formatToParts(date);
+  });
+  if (zonedPartsFormatters.size >= 128) {
+    zonedPartsFormatters.delete(zonedPartsFormatters.keys().next().value!);
+  }
+  zonedPartsFormatters.set(timezone, formatter);
+  return formatter;
+};
+
+export const getZonedParts = (date: Date, timezone: string): ZonedParts => {
+  const parts = getZonedPartsFormatter(timezone).formatToParts(date);
 
   const map: Record<string, string> = {};
   for (const p of parts) {
@@ -197,12 +213,17 @@ export interface DaySlice {
 export const splitRangeByZonedDays = (startMs: number, endMs: number, timeZone: string): DaySlice[] => {
   if (endMs <= startMs) return [];
   const slices: DaySlice[] = [];
+  // Most task records stay within one day. Only search for midnight when the
+  // range actually crosses it; end is exclusive, including exact-midnight ends.
+  const lastDateStr = getDateStringInZone(endMs - 1, timeZone);
   let cursor = startMs;
   let guard = 0;
   while (cursor < endMs && guard < 400) {
     guard++;
     const dateStr = getDateStringInZone(cursor, timeZone);
-    const pieceEnd = Math.min(endMs, nextZonedMidnightUtc(cursor, timeZone));
+    const pieceEnd = dateStr === lastDateStr
+      ? endMs
+      : Math.min(endMs, nextZonedMidnightUtc(cursor, timeZone));
     slices.push({ dateStr, start: cursor, end: pieceEnd, durationMs: pieceEnd - cursor });
     cursor = pieceEnd;
   }
