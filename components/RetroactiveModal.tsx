@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Tag } from '../types';
 import { addDaysToDateStr } from '../utils/timeUtils';
-import { recentRange, validateRetroactiveRange, wallTimeAt, WallTime } from '../utils/retroactiveTime';
+import { recentRange, rangeFromStart, validateRetroactiveRange, wallTimeAt, WallTime } from '../utils/retroactiveTime';
+import { TimePicker24 } from './TimePicker24';
 
 interface RetroactiveModalProps {
   tags: Tag[];
@@ -53,6 +54,11 @@ export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, timezo
     setNow(timestamp);
     changeEndpoint('end', wallTimeAt(timestamp, timezone));
   };
+
+  const durationChoices = [15, 30, 45, 60, 90, 120].map(minutes => {
+    const next = rangeFromStart(range.start, timezone, minutes);
+    return { minutes, next, valid: next !== null && validateRetroactiveRange(next, timezone, now).ok };
+  });
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -113,12 +119,17 @@ export const RetroactiveModal: React.FC<RetroactiveModalProps> = ({ tags, timezo
                 <div className="flex gap-2">
                   {[{ name: '昨天', date: addDaysToDateStr(current.date, -1) }, { name: '今天', date: current.date }].map(day => <button type="button" key={day.name} aria-label={`${label}选${day.name}`} onClick={() => changeEndpoint(target, { date: day.date })} className={`flex-1 rounded px-2 py-1 text-xs border ${point.date === day.date ? 'border-blue-400 text-blue-200' : 'border-slate-600 text-slate-400 hover:text-white'}`}>{day.name} {day.date.slice(5)}</button>)}
                 </div>
-                <label className="block text-xs text-slate-400">{label}时刻（24 小时）
-                  <input type="text" inputMode="numeric" placeholder="HH:mm" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" maxLength={5} value={point.time} required onChange={e => changeEndpoint(target, { time: e.target.value })} className={`${inputClass} mt-1 font-mono text-lg`} />
-                </label>
-                {target === 'end' ? <button type="button" onClick={endNow} className="text-xs text-purple-300 hover:text-purple-200">结束设为现在</button> : <p className="text-xs text-slate-500">可直接输入，例如 09:30</p>}
+                <div className="space-y-1"><p className="text-xs text-slate-400">{label}时刻（24 小时）</p>
+                  <TimePicker24 label={label} date={point.date} value={point.time} maxTime={point.date === current.date ? current.time : undefined} onChange={time => changeEndpoint(target, { time })} />
+                </div>
+                {target === 'end' ? <button type="button" onClick={endNow} className="text-xs text-purple-300 hover:text-purple-200">结束设为现在</button> : <p className="text-xs text-slate-500">直接点选小时、分钟，不必打字</p>}
               </fieldset>;
             })}
+          </div>
+
+          <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-3 space-y-2">
+            <p className="text-xs text-slate-300">已选开始时间，持续多久？<span className="text-slate-500 ml-1">点击后填入结束时间</span></p>
+            <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">{durationChoices.map(({ minutes, next, valid }) => <button type="button" key={minutes} aria-label={`持续 ${minutes} 分钟`} disabled={!valid} title={valid && next ? `结束：${next.end.date} ${next.end.time}` : '结束将超过现在，或所选时刻无效'} onClick={() => { if (next && valid) { setRange(next); setConfirmedLong(false); setSubmitError(''); } }} className="rounded-lg border border-slate-600 py-2 text-xs text-slate-200 hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed">{minutes < 60 ? `${minutes} 分钟` : `${minutes / 60} 小时`}</button>)}</div>
           </div>
 
           <label className="block text-xs text-slate-400">备注（可选）

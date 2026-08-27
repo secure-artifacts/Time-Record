@@ -27,6 +27,19 @@ const parseWallTime = (point: WallTime, timezone: string): number | null => {
   }
 };
 
+// Called only by an explicit duration shortcut. Normal endpoint edits never
+// invoke this, so choosing an hour still cannot silently change the date.
+export const rangeFromStart = (start: WallTime, timezone: string, minutes: number): RetroactiveRange | null => {
+  if (!Number.isInteger(minutes) || minutes <= 0) return null;
+  const startMs = parseWallTime(start, timezone);
+  if (startMs === null) return null;
+  const endMs = startMs + minutes * 60000;
+  const end = wallTimeAt(endMs, timezone);
+  // A repeated DST hour must not turn a requested duration into a different one.
+  if (parseWallTime(end, timezone) !== endMs) return null;
+  return { start: { ...start }, end };
+};
+
 type RangeResult =
   | { ok: false; code: 'invalid' | 'end-before-start' | 'future'; message: string }
   | { ok: true; startMs: number; endMs: number; minutes: number; crossesDate: boolean; needsConfirmation: boolean };
